@@ -283,7 +283,7 @@ class Env(Generic[ASpecificEnvConf]):
             return chmod_cmd
 
         entry_add_timeout = (
-            f"/bin/sh -c 'timeout --kill-after=10 {self.conf.running_timeout_period} {entry}; "
+            f"timeout --kill-after=10 {self.conf.running_timeout_period} {entry}; "
             + "entry_exit_code=$?; "
             + (
                 f"{_get_chmod_cmd(self.conf.mount_path)}; "
@@ -293,7 +293,7 @@ class Env(Generic[ASpecificEnvConf]):
                 if isinstance(self.conf, DockerConf)
                 else ""
             )
-            + "exit $entry_exit_code'"
+            + "exit $entry_exit_code"
         )
 
         if self.conf.enable_cache:
@@ -466,12 +466,12 @@ class LocalEnv(Env[ASpecificLocalConf]):
                 for real, link in vol_map.items():
                     link_path = Path(link)
                     real_path = Path(real)
-                    if not link_path.parent.exists():
-                        link_path.parent.mkdir(parents=True, exist_ok=True)
-                    if link_path.exists() or link_path.is_symlink():
-                        link_path.unlink()
-                    link_path.symlink_to(real_path)
-                    created_links.append(link_path)
+                    # if not link_path.parent.exists():
+                        # link_path.parent.mkdir(parents=True, exist_ok=True)
+                    # if link_path.exists() and link_path.is_symlink():
+                        # link_path.unlink()
+                    # link_path.symlink_to(real_path)
+                    # created_links.append(link_path)
                 yield
             finally:
                 for p in created_links:
@@ -485,7 +485,7 @@ class LocalEnv(Env[ASpecificLocalConf]):
             # Setup environment
             if env is None:
                 env = {}
-            path = [*self.conf.bin_path.split(":"), "/bin/", "/usr/bin/", *env.get("PATH", "").split(":")]
+            path = [*os.environ.get("PATH").split(":"), *self.conf.bin_path.split(":"), "/bin/", "/usr/bin/", *env.get("PATH", "").split(":")]
             env["PATH"] = ":".join(path)
 
             if entry is None:
