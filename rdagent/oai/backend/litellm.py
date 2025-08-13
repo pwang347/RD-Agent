@@ -1,5 +1,5 @@
 import copyreg
-from typing import Any, Literal, cast
+from typing import Any, Literal, Optional, Type, Union, cast
 
 import numpy as np
 from litellm import (
@@ -7,10 +7,12 @@ from litellm import (
     completion,
     completion_cost,
     embedding,
+    get_max_tokens,
     supports_function_calling,
     supports_response_schema,
     token_counter,
 )
+from pydantic import BaseModel
 
 from rdagent.log import LogColors
 from rdagent.log import rdagent_logger as logger
@@ -39,14 +41,19 @@ class LiteLLMSettings(LLMSettings):
 
 
 LITELLM_SETTINGS = LiteLLMSettings()
-logger.info(f"{LITELLM_SETTINGS}")
 ACC_COST = 0.0
 
 
 class LiteLLMAPIBackend(APIBackend):
     """LiteLLM implementation of APIBackend interface"""
 
+    _has_logged_settings: bool = False
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if not self.__class__._has_logged_settings:
+            logger.info(f"{LITELLM_SETTINGS}")
+            logger.log_object(LITELLM_SETTINGS.model_dump(), tag="LITELLM_SETTINGS")
+            self.__class__._has_logged_settings = True
         super().__init__(*args, **kwargs)
 
     def _calculate_token_from_messages(self, messages: list[dict[str, Any]]) -> int:
@@ -60,9 +67,7 @@ class LiteLLMAPIBackend(APIBackend):
         logger.info(f"{LogColors.CYAN}Token count: {LogColors.END} {num_tokens}", tag="debug_litellm_token")
         return num_tokens
 
-    def _create_embedding_inner_function(
-        self, input_content_list: list[str], *args: Any, **kwargs: Any
-    ) -> list[list[float]]:  # noqa: ARG002
+    def _create_embedding_inner_function(self, input_content_list: list[str]) -> list[list[float]]:
         """
         Call the embedding function
         """
@@ -76,8 +81,6 @@ class LiteLLMAPIBackend(APIBackend):
         response = embedding(
             model=model_name,
             input=input_content_list,
-            *args,
-            **kwargs,
         )
         response_list = [data["embedding"] for data in response.data]
         return response_list
@@ -85,21 +88,24 @@ class LiteLLMAPIBackend(APIBackend):
     def _create_chat_completion_inner_function(  # type: ignore[no-untyped-def] # noqa: C901, PLR0912, PLR0915
         self,
         messages: list[dict[str, Any]],
-        json_mode: bool = False,
+        response_format: Optional[Union[dict, Type[BaseModel]]] = None,
         *args,
         **kwargs,
     ) -> tuple[str, str | None]:
         """
         Call the chat completion function
         """
-        if json_mode and supports_response_schema(model=LITELLM_SETTINGS.chat_model):
-            kwargs["response_format"] = {"type": "json_object"}
-        elif not supports_response_schema(model=LITELLM_SETTINGS.chat_model) and "response_format" in kwargs:
+
+        if response_format and not supports_response_schema(model=LITELLM_SETTINGS.chat_model):
+            # Deepseek will enter this branch
             logger.warning(
-                f"{LogColors.RED}Model {LITELLM_SETTINGS.chat_model} does not support response schema, ignoring response_format argument.{LogColors.END}",
+                f"{LogColors.YELLOW}Model {LITELLM_SETTINGS.chat_model} does not support response schema, ignoring response_format argument.{LogColors.END}",
                 tag="llm_messages",
             )
-            kwargs.pop("response_format")
+            response_format = None
+
+        if response_format:
+            kwargs["response_format"] = response_format
 
         if LITELLM_SETTINGS.log_llm_chat_content:
             logger.info(self._build_log_messages(messages), tag="llm_messages")
@@ -191,8 +197,18 @@ class LiteLLMAPIBackend(APIBackend):
         )
         return content, finish_reason
 
-    def support_function_calling(self) -> bool:
+    def supports_response_schema(self) -> bool:
         """
         Check if the backend supports function calling
         """
-        return supports_function_calling(model=LITELLM_SETTINGS.chat_model) and LITELLM_SETTINGS.enable_function_call
+        return supports_response_schema(model=LITELLM_SETTINGS.chat_model) and LITELLM_SETTINGS.enable_response_schema
+
+    @property
+    def chat_token_limit(self) -> int:
+        try:
+            max_tokens = get_max_tokens(LITELLM_SETTINGS.chat_model)
+            if max_tokens is None:
+                return super().chat_token_limit
+            return max_tokens
+        except Exception as e:
+            return super().chat_token_limit

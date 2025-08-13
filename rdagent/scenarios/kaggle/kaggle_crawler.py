@@ -118,7 +118,7 @@ def download_data(competition: str, settings: ExtendedBaseSettings, enable_creat
             mleb_env = MLEBDockerEnv()
             mleb_env.prepare()
             (Path(zipfile_path)).mkdir(parents=True, exist_ok=True)
-            mleb_env.run(
+            mleb_env.check_output(
                 f"mlebench prepare -c {competition} --data-dir ./zip_files",
                 local_path=local_path,
                 running_extra_volume={str(Path("~/.kaggle").expanduser().absolute()): "/root/.kaggle"},
@@ -129,17 +129,19 @@ def download_data(competition: str, settings: ExtendedBaseSettings, enable_creat
 
             mleb_env = MLEBDockerEnv()
             mleb_env.prepare()
-            mleb_env.run(f"cp -r ./zip_files/{competition}/prepared/public/* ./{competition}", local_path=local_path)
+            mleb_env.check_output(
+                f"cp -r ./zip_files/{competition}/prepared/public/* ./{competition}", local_path=local_path
+            )
 
             for zip_path in competition_local_path.rglob("*.zip"):
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
                     if len(zip_ref.namelist()) == 1:
-                        mleb_env.run(
+                        mleb_env.check_output(
                             f"unzip -o ./{zip_path.relative_to(competition_local_path)} -d {zip_path.parent.relative_to(competition_local_path)}",
                             local_path=competition_local_path,
                         )
                     else:
-                        mleb_env.run(
+                        mleb_env.check_output(
                             f"mkdir -p ./{zip_path.parent.relative_to(competition_local_path)}/{zip_path.stem}; unzip -o ./{zip_path.relative_to(competition_local_path)} -d ./{zip_path.parent.relative_to(competition_local_path)}/{zip_path.stem}",
                             local_path=competition_local_path,
                         )
@@ -150,13 +152,13 @@ def download_data(competition: str, settings: ExtendedBaseSettings, enable_creat
                 is_gzip_file = open(tar_path, "rb").read(2) == b"\x1f\x8b"
                 with tarfile.open(tar_path, "r:gz") if is_gzip_file else tarfile.open(tar_path, "r") as tar_ref:
                     if len(tar_ref.getmembers()) == 1:
-                        mleb_env.run(
+                        mleb_env.check_output(
                             f"tar -{'xzf' if is_gzip_file else 'xf'} ./{tar_path.relative_to(competition_local_path)} -C {tar_path.parent.relative_to(competition_local_path)}",
                             local_path=competition_local_path,
                         )
                     else:
                         folder_name = tar_path.name.replace(".tar", "").replace(".gz", "")
-                        mleb_env.run(
+                        mleb_env.check_output(
                             f"mkdir -p ./{tar_path.parent.relative_to(competition_local_path)}/{folder_name}; tar -{'xzf' if is_gzip_file else 'xf'} ./{tar_path.relative_to(competition_local_path)} -C ./{tar_path.parent.relative_to(competition_local_path)}/{folder_name}",
                             local_path=competition_local_path,
                         )
@@ -205,12 +207,25 @@ def unzip_data(unzip_file_path: str, unzip_target_path: str) -> None:
 
 @cache_with_pickle(hash_func=lambda x: x, force=True)
 def leaderboard_scores(competition: str) -> list[float]:
+    import pandas as pd
     from kaggle.api.kaggle_api_extended import KaggleApi
+
+    from rdagent.core.conf import RD_AGENT_SETTINGS
 
     api = KaggleApi()
     api.authenticate()
-    ll = api.competition_leaderboard_view(competition)
-    return [float(x.score) for x in ll]
+
+    # download leaderboard zip file by api
+    lb_path = Path(f"{RD_AGENT_SETTINGS.pickle_cache_folder_path_str}/leaderboards/{competition}")
+    api.competition_leaderboard_download(competition, path=lb_path)
+
+    # unzip the leaderboard zip file
+    unzip_data(f"{lb_path}/{competition}.zip", lb_path)
+    csv_path = list(lb_path.glob("*.csv"))[0]
+
+    # read the csv file and return the scores
+    df = pd.read_csv(csv_path)
+    return df["Score"].tolist()
 
 
 def get_metric_direction(competition: str) -> bool:
@@ -219,6 +234,7 @@ def get_metric_direction(competition: str) -> bool:
     """
     leaderboard = leaderboard_scores(competition)
     if float(leaderboard[0]) == float(leaderboard[-1]):
+        # This happens when top scores are all the same, such as 0 or 1.
         return float(leaderboard[0]) >= 0.5
     return float(leaderboard[0]) > float(leaderboard[-1])
 

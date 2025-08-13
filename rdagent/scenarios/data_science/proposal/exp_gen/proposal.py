@@ -16,10 +16,21 @@ from rdagent.core.proposal import ExpGen
 from rdagent.core.scenario import Scenario
 from rdagent.log import rdagent_logger as logger
 from rdagent.oai.llm_utils import APIBackend, md5_hash
+from rdagent.scenarios.data_science.dev.feedback import ExperimentFeedback
 from rdagent.scenarios.data_science.experiment.experiment import DSExperiment
 from rdagent.scenarios.data_science.proposal.exp_gen.base import DSHypothesis, DSTrace
-from rdagent.scenarios.data_science.proposal.exp_gen.draft import DSDraftExpGen
+from rdagent.scenarios.data_science.proposal.exp_gen.draft.draft import (
+    DSDraftExpGen,  # TODO: DSDraftExpGen should be moved to router in the further
+)
 from rdagent.scenarios.data_science.proposal.exp_gen.idea_pool import DSIdea
+from rdagent.scenarios.data_science.proposal.exp_gen.planner import (
+    DSExperimentPlan,
+    RD_Agent_TIMER_wrapper,
+)
+from rdagent.scenarios.data_science.proposal.exp_gen.utils import (
+    get_available_packages_prompt,
+    get_packages,
+)
 from rdagent.utils.agent.tpl import T
 from rdagent.utils.repo.diff import generate_diff_from_dict
 from rdagent.utils.workflow import wait_retry
@@ -271,6 +282,11 @@ class CodingSketch(BaseModel):
         "The content **must** be formatted using Markdown, with logical sections, key decision points, or implementation steps clearly organized by level-3 headings (i.e., `###`). "
         "This field should provide sufficient detail for a developer to understand the implementation flow, algorithms, data handling, and key logic points without ambiguity."
     )
+    packages: List[str] = Field(
+        default=None,
+        description="A list of third-party package names (PyPI) that the planned implementation will import. "
+        "Used to query the runtime environment dynamically. Leave `null` or omit if not applicable.",
+    )
 
 
 def draft_exp_in_decomposition(scen: Scenario, trace: DSTrace) -> None | DSDraftExpGen:
@@ -285,7 +301,11 @@ def draft_exp_in_decomposition(scen: Scenario, trace: DSTrace) -> None | DSDraft
 
 
 class DSProposalV1ExpGen(ExpGen):
-    def gen(self, trace: DSTrace) -> DSExperiment:
+    def gen(
+        self,
+        trace: DSTrace,
+        plan: DSExperimentPlan | None = None,
+    ) -> DSExperiment:
         # Drafting Stage
         if draft_exp := draft_exp_in_decomposition(self.scen, trace):
             return draft_exp
@@ -371,7 +391,9 @@ class DSProposalV1ExpGen(ExpGen):
             if DS_RD_SETTING.spec_enabled:
                 task_spec = sota_exp.experiment_workspace.file_dict[component_info["spec_file"]]
             else:
-                task_spec = T(f"scenarios.data_science.share:component_spec.{component}").r()
+                task_spec = T(f"scenarios.data_science.share:component_spec.{component}").r(
+                    enable_notebook_conversion=DS_RD_SETTING.enable_notebook_conversion,
+                )
             system_prompt = T(".prompts:direct_exp_gen.system").r(
                 targets=component_info["target_name"],
                 component=component,
@@ -456,13 +478,19 @@ class DSProposalV1ExpGen(ExpGen):
 class DSProposalV2ExpGen(ExpGen):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.support_function_calling = APIBackend().support_function_calling()
+        self.supports_response_schema = APIBackend().supports_response_schema()
 
-    def identify_scenario_problem(self, scenario_desc: str, sota_exp_desc: str) -> Dict:
+    def identify_scenario_problem(
+        self,
+        scenario_desc: str,
+        sota_exp_desc: str,
+        exp_gen_plan: Dict,
+    ) -> Dict:
         sys_prompt = T(".prompts_v2:scenario_problem.system").r(
             problem_output_format=(
-                T(".prompts_v2:output_format.problem").r() if not self.support_function_calling else None
+                T(".prompts_v2:output_format.problem").r() if not self.supports_response_schema else None
             ),
+            plan=exp_gen_plan,
         )
         user_prompt = T(".prompts_v2:scenario_problem.user").r(
             scenario_desc=scenario_desc,
@@ -471,10 +499,10 @@ class DSProposalV2ExpGen(ExpGen):
         response = APIBackend().build_messages_and_create_chat_completion(
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
-            response_format=ScenarioChallenges if self.support_function_calling else {"type": "json_object"},
-            json_target_type=Dict[str, Dict[str, str]] if not self.support_function_calling else None,
+            response_format=ScenarioChallenges if self.supports_response_schema else {"type": "json_object"},
+            json_target_type=Dict[str, Dict[str, str]] if not self.supports_response_schema else None,
         )
-        if self.support_function_calling:
+        if self.supports_response_schema:
             challenges = ScenarioChallenges(**json.loads(response))
             # Translate to problems
             problems = {o.caption: {"problem": o.statement, "reason": o.reasoning} for o in challenges.challenges}
@@ -489,7 +517,7 @@ class DSProposalV2ExpGen(ExpGen):
     ) -> Dict:
         sys_prompt = T(".prompts_v2:feedback_problem.system").r(
             problem_output_format=(
-                T(".prompts_v2:output_format.problem").r() if not self.support_function_calling else None
+                T(".prompts_v2:output_format.problem").r() if not self.supports_response_schema else None
             ),
             inject_diverse=inject_diverse,
         )
@@ -501,10 +529,10 @@ class DSProposalV2ExpGen(ExpGen):
         response = APIBackend().build_messages_and_create_chat_completion(
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
-            response_format=TraceChallenges if self.support_function_calling else {"type": "json_object"},
-            json_target_type=Dict[str, Dict[str, str]] if not self.support_function_calling else None,
+            response_format=TraceChallenges if self.supports_response_schema else {"type": "json_object"},
+            json_target_type=Dict[str, Dict[str, str]] if not self.supports_response_schema else None,
         )
-        if self.support_function_calling:
+        if self.supports_response_schema:
             challenges = TraceChallenges(**json.loads(response))
             # Translate to problems
             problems = {o.caption: {"problem": o.statement, "reason": o.reasoning} for o in challenges.challenges}
@@ -515,7 +543,13 @@ class DSProposalV2ExpGen(ExpGen):
         return problems
 
     def identify_problem(
-        self, current_sub_trace, scenario_desc, sota_exp_desc, exp_feedback_list_desc, inject_diverse
+        self,
+        current_sub_trace,
+        scenario_desc,
+        sota_exp_desc,
+        exp_feedback_list_desc,
+        inject_diverse,
+        exp_gen_plan,
     ) -> Dict:
         sota_exp_num = sum(1 for _, fb in current_sub_trace if fb.decision)
         failed_exp_num = len(current_sub_trace) - sota_exp_num
@@ -527,6 +561,7 @@ class DSProposalV2ExpGen(ExpGen):
             scen_problems = self.identify_scenario_problem(
                 scenario_desc=scenario_desc,
                 sota_exp_desc=sota_exp_desc,
+                exp_gen_plan=exp_gen_plan,
             )
             for problem_name in scen_problems:
                 scen_problems[problem_name]["label"] = "SCENARIO_PROBLEM"
@@ -555,25 +590,33 @@ class DSProposalV2ExpGen(ExpGen):
         pipeline: bool,
         enable_idea_pool: bool,
         inject_diverse: bool = False,
+        exp_gen_plan: Optional[Dict] = None,
+        packages_prompt: str = "",
     ) -> Dict:
         problem_formatted_str = ""
         for i, (problem_name, problem_dict) in enumerate(problems.items()):
             problem_formatted_str += f"## {i+1}. {problem_name}\n"
-            problem_formatted_str += f"{problem_dict['problem']}\n"
+            problem_formatted_str += f"Statement: {problem_dict['problem']}\n"
+            problem_formatted_str += f"Reason: {problem_dict['reason']}\n"
             if "idea" in problem_dict:
                 idea_formatted_str = DSIdea(problem_dict["idea"]).to_formatted_str()
                 problem_formatted_str += f"Sampled Idea by user: \n{idea_formatted_str}\n"
             problem_formatted_str += "\n\n"
 
+        # add available packages prompt
+        if packages_prompt:
+            problem_formatted_str += f"\n{packages_prompt}\n"
+
         sys_prompt = T(".prompts_v2:hypothesis_gen.system").r(
             hypothesis_output_format=(
                 T(".prompts_v2:output_format.hypothesis").r(pipeline=pipeline, enable_idea_pool=enable_idea_pool)
-                if not self.support_function_calling
+                if not self.supports_response_schema
                 else None
             ),
             pipeline=pipeline,
             enable_idea_pool=enable_idea_pool,
             inject_diverse=inject_diverse,
+            plan=exp_gen_plan,
         )
         user_prompt = T(".prompts_v2:hypothesis_gen.user").r(
             scenario_desc=scenario_desc,
@@ -585,17 +628,17 @@ class DSProposalV2ExpGen(ExpGen):
         response = APIBackend().build_messages_and_create_chat_completion(
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
-            response_format=HypothesisList if self.support_function_calling else {"type": "json_object"},
+            response_format=HypothesisList if self.supports_response_schema else {"type": "json_object"},
             json_target_type=(
-                Dict[str, Dict[str, str | Dict[str, str | int]]] if not self.support_function_calling else None
+                Dict[str, Dict[str, str | Dict[str, str | int]]] if not self.supports_response_schema else None
             ),
         )
-        if self.support_function_calling:
+        if self.supports_response_schema:
             hypotheses = HypothesisList(**json.loads(response))
             resp_dict = {
                 h.caption: {
                     "reason": h.challenge,
-                    "component": h.component,
+                    "component": h.component.value,
                     "hypothesis": h.hypothesis,
                     "evaluation": {
                         "alignment_score": h.evaluation.alignment.score,
@@ -619,6 +662,157 @@ class DSProposalV2ExpGen(ExpGen):
             raise ValueError("Problem names are not fully aligned.")
 
         return resp_dict
+
+    @wait_retry(retry_n=5)
+    def hypothesis_critique(
+        self,
+        hypothesis_dict: Dict,
+        problems_dict: Dict,
+        scenario_desc: str,
+        sota_exp_desc: str,
+        exp_feedback_list_desc: str,
+    ) -> Dict:
+        """
+        Critique the generated hypotheses, identifying flaws and suggesting improvements.
+        """
+        hypotheses_formatted = ""
+        for i, (problem_name, hypothesis_data) in enumerate(hypothesis_dict.items()):
+
+            problem_info = problems_dict.get(problem_name, {})
+            hypotheses_formatted += f"## {i+1}. **Problem Name:** {problem_name}\n"
+            hypotheses_formatted += f"**Original Problem:** {problem_info.get('problem', 'Not available')}\n"
+            hypotheses_formatted += f"**Component:** {hypothesis_data.get('component', 'Unknown')}\n"
+            hypotheses_formatted += f"**Hypothesis:** {hypothesis_data.get('hypothesis', 'Not provided')}\n"
+            hypotheses_formatted += f"**Reason:** {hypothesis_data.get('reason', 'Not provided')}\n\n"
+
+        sys_prompt = T(".prompts_v2:hypothesis_critique.system").r(
+            critique_output_format=T(".prompts_v2:output_format.critique").r(),
+        )
+        user_prompt = T(".prompts_v2:hypothesis_critique.user").r(
+            scenario_desc=scenario_desc,
+            exp_and_feedback_list_desc=exp_feedback_list_desc,
+            sota_exp_desc=sota_exp_desc,
+            hypotheses_formatted=hypotheses_formatted,
+        )
+
+        # Use json_object mode since hypothesis names are dynamic
+        response = APIBackend().build_messages_and_create_chat_completion(
+            user_prompt=user_prompt,
+            system_prompt=sys_prompt,
+            response_format={"type": "json_object"},
+            json_target_type=dict,
+        )
+
+        response_dict = json.loads(response)
+
+        # Improved error handling and validation
+        if "critiques" in response_dict:
+            critiques = response_dict["critiques"]
+        else:
+            # If format is incorrect, try to extract critiques directly
+            # Validate that all expected problem names are present
+            expected_problems = set(hypothesis_dict.keys())
+            available_problems = set(response_dict.keys())
+
+            if expected_problems.issubset(available_problems):
+                critiques = response_dict
+            else:
+                raise ValueError(
+                    f"Critique response missing expected problems. Expected: {expected_problems}, Got: {available_problems}"
+                )
+
+        # Validate that we have critiques for all hypotheses
+        missing_critiques = set(hypothesis_dict.keys()) - set(critiques.keys())
+        if missing_critiques:
+            logger.warning(f"Missing critiques for problems: {missing_critiques}")
+            # Add default critiques for missing ones
+            for problem_name in missing_critiques:
+                critiques[problem_name] = {"critique": "No specific critique available for this hypothesis."}
+
+        logger.info(f"Generated critiques for {len(critiques)} hypothesis")
+        return critiques
+
+    @wait_retry(retry_n=5)
+    def hypothesis_rewrite(
+        self,
+        hypothesis_dict: Dict,
+        critiques_dict: Dict,
+        scenario_desc: str,
+        sota_exp_desc: str,
+        exp_feedback_list_desc: str,
+        packages_prompt: str = "",
+    ) -> Dict:
+        """
+        Generate improved hypotheses based on critique feedback for each original hypothesis.
+        Returns a dict with the same keys as hypothesis_dict, containing improved versions.
+        """
+        hypothesis_critique_pairs = ""
+        for i, problem_name in enumerate(hypothesis_dict.keys()):
+            hypothesis_data = hypothesis_dict[problem_name]
+            critique_data = critiques_dict.get(problem_name, {})
+
+            hypothesis_critique_pairs += f"## Original Hypothesis {i+1}: {problem_name}\n"
+            hypothesis_critique_pairs += f"**Hypothesis:** {hypothesis_data.get('hypothesis', 'Not provided')}\n"
+            hypothesis_critique_pairs += f"**Component:** {hypothesis_data.get('component', 'Unknown')}\n"
+            hypothesis_critique_pairs += f"**Reasoning:** {hypothesis_data.get('reason', 'Not provided')}\n"
+            hypothesis_critique_pairs += f"**Critique:** {critique_data.get('critique', 'No critique available')}\n\n"
+
+        time_status = None
+        if DS_RD_SETTING.enable_scale_check and RD_Agent_TIMER_wrapper.timer.started:
+            remain_time = RD_Agent_TIMER_wrapper.timer.remain_time()
+            all_duration = RD_Agent_TIMER_wrapper.timer.all_duration
+            remain_percent = remain_time / all_duration
+            time_status = (
+                f"Remain time: {remain_time.total_seconds() / 3600:.2f} hours, "
+                f"{remain_percent:.2%} remaining of total time: {all_duration.total_seconds() / 3600:.2f} hours."
+            )
+
+        sys_prompt = T(".prompts_v2:hypothesis_rewrite.system").r(
+            rewrite_output_format=T(".prompts_v2:output_format.rewrite").r(
+                enable_scale_check=DS_RD_SETTING.enable_scale_check
+            ),
+            enable_scale_check=DS_RD_SETTING.enable_scale_check,
+        )
+        user_prompt = T(".prompts_v2:hypothesis_rewrite.user").r(
+            scenario_desc=scenario_desc,
+            exp_and_feedback_list_desc=exp_feedback_list_desc,
+            sota_exp_desc=sota_exp_desc,
+            hypothesis_critique_pairs=hypothesis_critique_pairs,
+            time_status=time_status,
+            packages_prompt=packages_prompt,
+        )
+
+        response = APIBackend().build_messages_and_create_chat_completion(
+            user_prompt=user_prompt,
+            system_prompt=sys_prompt,
+            response_format={"type": "json_object"},
+            json_target_type=dict,
+        )
+
+        improved_hypotheses_dict = json.loads(response)
+
+        # Validate that we have rewritten hypotheses for all original hypotheses
+        expected_problems = set(hypothesis_dict.keys())
+        available_problems = set(  # The code snippet provided is a comment in Python. It appears to be
+            # a placeholder for a function or variable named
+            # `improved_hypotheses_dict`. The actual implementation of this
+            # function or variable is not provided in the code snippet.
+            improved_hypotheses_dict.keys()
+        )
+
+        if not expected_problems.issubset(available_problems):
+            missing_problems = expected_problems - available_problems
+            # Raise exception to trigger retry mechanism
+            raise ValueError(f"Rewrite response missing expected problems. Missing: {missing_problems}")
+
+        # Note: We don't preserve 'inspired' field from original hypotheses
+        # because after critique and rewrite, the hypothesis may have changed significantly
+        # and the original inspiration may no longer be relevant
+
+        logger.info(
+            f"Generated rewritten versions of {len(improved_hypotheses_dict)} hypotheses based on critique feedback"
+        )
+        return improved_hypotheses_dict
 
     def compute_top_scores(
         self,
@@ -708,6 +902,7 @@ class DSProposalV2ExpGen(ExpGen):
             problem_name=max_score_problem_name,
             problem_desc=problem_dict.get("problem", "Problem description not provided"),
             problem_label=problem_dict.get("label", "FEEDBACK_PROBLEM"),
+            appendix=hypothesis_dict[max_score_problem_name].get("appendix", None),
         )
 
     def task_gen(
@@ -719,17 +914,19 @@ class DSProposalV2ExpGen(ExpGen):
         hypotheses: list[DSHypothesis],
         pipeline: bool,
         failed_exp_feedback_list_desc: str,
+        fb_to_sota_exp: ExperimentFeedback | None = None,
     ) -> DSExperiment:
         if pipeline:
             component_info = get_component("Pipeline")
         else:
             component_info = get_component(hypotheses[0].component)
         data_folder_info = self.scen.processed_data_folder_description
+        workflow_check = not pipeline and hypotheses[0].component != "Workflow"
         sys_prompt = T(".prompts_v2:task_gen.system").r(
-            task_output_format=component_info["task_output_format"] if not self.support_function_calling else None,
-            # task_output_format=component_info["task_output_format"],
+            task_output_format=component_info["task_output_format"] if not self.supports_response_schema else None,
             component_desc=component_desc,
-            workflow_check=not pipeline and hypotheses[0].component != "Workflow",
+            workflow_check=workflow_check,
+            metric_name=self.scen.metric_name,
         )
         user_prompt = T(".prompts_v2:task_gen.user").r(
             scenario_desc=scenario_desc,
@@ -737,54 +934,61 @@ class DSProposalV2ExpGen(ExpGen):
             sota_exp_desc=sota_exp_desc,
             hypotheses=hypotheses,
             failed_exp_and_feedback_list_desc=failed_exp_feedback_list_desc,
+            eda_improvement=fb_to_sota_exp.eda_improvement if fb_to_sota_exp else None,
         )
+
         response = APIBackend().build_messages_and_create_chat_completion(
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
-            response_format=CodingSketch if self.support_function_calling else {"type": "json_object"},
-            json_target_type=Dict[str, str | Dict[str, str]] if not self.support_function_calling else None,
+            response_format=CodingSketch if self.supports_response_schema else {"type": "json_object"},
+            json_target_type=Dict[str, str | List[str] | Dict[str, str]] if not self.supports_response_schema else None,
         )
+
         task_dict = json.loads(response)
-        task_design = (
-            task_dict.get("task_design", {}) if not self.support_function_calling else task_dict.get("sketch", {})
-        )
-        logger.info(f"Task design:\n{task_design}")
+
+        # 1) explain the response and get main task_description
+        not_found_str = f"{component_info['target_name']} description not provided"
+        if self.supports_response_schema:
+            # task_dict: {"sketch": str, ...}
+            task_desc = task_dict.get("sketch", not_found_str)
+        else:
+            if workflow_check:
+                # task_dict:  {"task_design": ...., "workflow_update": ....}
+                task_desc = task_dict.get("task_design", {}).get("description", not_found_str)
+            else:
+                # task_dict:  {"description": ....}
+                task_desc = task_dict.get("description", not_found_str)
+        # task_desc: str, a description of the task
+
+        # 2) create the main task
+        logger.info(f"Task design:\n{task_desc}")
         task_name = hypotheses[0].component
-        description = (
-            task_design
-            if isinstance(task_design, str)
-            else task_design.get("description", f"{component_info['target_name']} description not provided")
-        )
         task_class = component_info["task_class"]
         task = task_class(
             name=task_name,
-            description=description,
+            description=task_desc,
         )
-        new_workflow_desc = task_dict.get("workflow_update", "No update needed")
+
+        assert isinstance(task, PipelineTask), f"Task {task_name} is not a PipelineTask, got {type(task)}"
+        # only for llm with response schema.(TODO: support for non-schema llm?)
+        # If the LLM provides a "packages" field (list[str]), compute runtime environment now and cache it for subsequent prompts in later loops.
+        if isinstance(task_dict, dict) and "packages" in task_dict and isinstance(task_dict["packages"], list):
+            pkgs: list[str] = [str(p) for p in task_dict["packages"]]
+            # Persist for later stages
+            task.package_info = get_packages(pkgs)
+
         exp = DSExperiment(pending_tasks_list=[[task]], hypothesis=hypotheses[0])
-        # exp.experiment_workspace.inject_code_from_folder(sota_exp.experiment_workspace.workspace_path)
         if sota_exp is not None:
             exp.experiment_workspace.inject_code_from_file_dict(sota_exp.experiment_workspace)
-        if not pipeline and new_workflow_desc != "No update needed":
+
+        # 3) create the workflow update task
+        if workflow_check:
             workflow_task = WorkflowTask(
                 name="Workflow",
-                description=new_workflow_desc,
+                description=task_dict.get("workflow_update", "No update needed"),
             )
             exp.pending_tasks_list.append([workflow_task])
         return exp
-
-    def get_scenario_all_desc(self, trace: DSTrace, eda_output=None) -> str:
-        return T(".prompts_v2:scenario_description").r(
-            background=trace.scen.background,
-            submission_specifications=trace.scen.submission_specifications,
-            evaluation=trace.scen.metric_description,
-            metric_name=trace.scen.metric_name,
-            metric_direction=trace.scen.metric_direction,
-            raw_description=trace.scen.raw_description,
-            use_raw_description=DS_RD_SETTING.use_raw_description,
-            time_limit=f"{DS_RD_SETTING.full_timeout / 60 / 60 : .2f} hours",
-            eda_output=eda_output,
-        )
 
     def get_all_hypotheses(self, problem_dict: dict, hypothesis_dict: dict) -> list[DSHypothesis]:
         result = []
@@ -798,6 +1002,7 @@ class DSProposalV2ExpGen(ExpGen):
                     problem_name=name,
                     problem_desc=problem_data.get("problem", "Problem description not provided"),
                     problem_label=problem_data.get("label", "FEEDBACK_PROBLEM"),
+                    appendix=data.get("appendix", None),
                 )
             )
         return result
@@ -805,8 +1010,8 @@ class DSProposalV2ExpGen(ExpGen):
     def gen(
         self,
         trace: DSTrace,
+        plan: DSExperimentPlan | None = None,
     ) -> DSExperiment:
-
         pipeline = DS_RD_SETTING.coder_on_whole_pipeline
         if not pipeline and (draft_exp := draft_exp_in_decomposition(self.scen, trace)):
             return draft_exp
@@ -821,22 +1026,30 @@ class DSProposalV2ExpGen(ExpGen):
                 ]
             )
 
-        sota_exp = trace.sota_experiment()
+        if (sota_exp_fb := trace.sota_experiment_fb()) is None:
+            sota_exp, fb_to_sota_exp = None, None
+        else:
+            sota_exp, fb_to_sota_exp = sota_exp_fb
+
         if not isinstance(sota_exp, DSExperiment):
             eda_output = None
         else:
             eda_output = sota_exp.experiment_workspace.file_dict.get("EDA.md", None)
-        scenario_desc = self.get_scenario_all_desc(trace, eda_output=eda_output)
+        scenario_desc = self.scen.get_scenario_all_desc(eda_output=eda_output)
 
+        # the only sota exp
         sota_exp_desc = T("scenarios.data_science.share:describe.exp").r(
             exp=sota_exp, heading="Best of previous exploration of the scenario"
         )
 
+        # all exp and feedbacks
         exp_feedback_list_desc = T("scenarios.data_science.share:describe.trace").r(
             exp_and_feedback_list=trace.experiment_and_feedback_list_after_init(return_type="all"),
             type="all",
             pipeline=pipeline,
         )
+
+        # all failed exp and feedbacks
         failed_exp_feedback_list_desc = T("scenarios.data_science.share:describe.trace").r(
             exp_and_feedback_list=trace.experiment_and_feedback_list_after_init(return_type="failed"),
             type="failed",
@@ -854,6 +1067,9 @@ class DSProposalV2ExpGen(ExpGen):
         else:
             inject_diverse = False
 
+        # add available packages prompt
+        packages_prompt = get_available_packages_prompt()
+
         # Step 1: Identify problems
         all_problems = self.identify_problem(
             current_sub_trace=trace.get_parent_exps(),
@@ -861,6 +1077,7 @@ class DSProposalV2ExpGen(ExpGen):
             sota_exp_desc=sota_exp_desc,
             exp_feedback_list_desc=exp_feedback_list_desc,
             inject_diverse=inject_diverse,
+            exp_gen_plan=plan.get("exp_gen") if plan else None,
         )
 
         # Step 1.5: Sample ideas from idea pool
@@ -883,6 +1100,8 @@ class DSProposalV2ExpGen(ExpGen):
             pipeline=pipeline,
             enable_idea_pool=DS_RD_SETTING.enable_knowledge_base,
             inject_diverse=inject_diverse,
+            exp_gen_plan=plan.get("exp_gen") if plan else None,
+            packages_prompt=packages_prompt,
         )
         if not pipeline:
             sota_exp_model_file_count = len(
@@ -900,9 +1119,46 @@ class DSProposalV2ExpGen(ExpGen):
                 for name in pop_names:
                     hypothesis_dict.pop(name)
 
+        # Step 2.1 & 2.2: Hypothesis Critique and Rewrite Stage (controlled by enable_hypo_critique_rewrite)
+        if DS_RD_SETTING.enable_hypo_critique_rewrite:
+            logger.info(f"Hypothesis critique and rewrite enabled - processing {len(hypothesis_dict)} hypotheses")
+
+            # Critic Stage - Evaluate and identify flaws in hypotheses
+            logger.info(
+                f"Starting critic stage - evaluating {len(hypothesis_dict)} hypotheses for flaws and improvements"
+            )
+            try:
+                critiques_dict = self.hypothesis_critique(
+                    hypothesis_dict=hypothesis_dict,
+                    problems_dict=all_problems,
+                    scenario_desc=scenario_desc,
+                    sota_exp_desc=sota_exp_desc,
+                    exp_feedback_list_desc=exp_feedback_list_desc,
+                )
+                logger.info(f"Generated critiques for {len(critiques_dict)} hypotheses")
+
+                # Rewriter Stage - Generate improved hypotheses based on critiques
+                logger.info(f"Starting rewriter stage - generating improved hypotheses based on critique feedback")
+                improved_hypotheses_dict = self.hypothesis_rewrite(
+                    hypothesis_dict=hypothesis_dict,
+                    critiques_dict=critiques_dict,
+                    scenario_desc=scenario_desc,
+                    sota_exp_desc=sota_exp_desc,
+                    exp_feedback_list_desc=exp_feedback_list_desc,
+                    packages_prompt=packages_prompt,
+                )
+                logger.info(f"Successfully completed hypothesis critique and rewrite process")
+            except Exception as e:
+                logger.warning(f"Hypothesis critique and rewrite failed: {e}")
+                logger.info(f"Using original hypotheses as fallback instead of improved versions")
+                improved_hypotheses_dict = hypothesis_dict.copy()  # Use original hypotheses as fallback
+        else:
+            logger.info(f"Hypothesis critique and rewrite disabled - using original {len(hypothesis_dict)} hypotheses")
+            improved_hypotheses_dict = hypothesis_dict.copy()  # Use original hypotheses directly
+
         # Step 3: Select the best hypothesis
         pickled_problem_name, new_hypothesis = self.hypothesis_rank(
-            hypothesis_dict=hypothesis_dict,
+            hypothesis_dict=improved_hypotheses_dict,
             problem_dict=all_problems,
         )
         # Step 3.5: Update knowledge base with the picked problem
@@ -915,8 +1171,11 @@ class DSProposalV2ExpGen(ExpGen):
             sota_exp_desc=sota_exp_desc,
             sota_exp=sota_exp,
             hypotheses=(
-                [new_hypothesis] if len(trace.hist) > 0 else self.get_all_hypotheses(all_problems, hypothesis_dict)
+                [new_hypothesis]
+                if len(trace.hist) > 0
+                else self.get_all_hypotheses(all_problems, improved_hypotheses_dict)
             ),
             pipeline=pipeline,
             failed_exp_feedback_list_desc=failed_exp_feedback_list_desc,
+            fb_to_sota_exp=fb_to_sota_exp,
         )

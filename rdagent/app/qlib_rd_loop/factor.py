@@ -3,9 +3,12 @@ Factor workflow with session control
 """
 
 import asyncio
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 import fire
+import typer
+from typing_extensions import Annotated
 
 from rdagent.app.qlib_rd_loop.conf import FACTOR_PROP_SETTING
 from rdagent.components.workflow.rd_loop import RDLoop
@@ -25,7 +28,14 @@ class FactorRDLoop(RDLoop):
         return exp
 
 
-def main(path=None, step_n=None, loop_n=None, all_duration=None, checkout=True):
+def main(
+    path: Optional[str] = None,
+    step_n: Optional[int] = None,
+    loop_n: Optional[int] = None,
+    all_duration: str | None = None,
+    checkout: Annotated[bool, typer.Option("--checkout/--no-checkout", "-c/-C")] = True,
+    checkout_path: Optional[str] = None,
+):
     """
     Auto R&D Evolving loop for fintech factors.
 
@@ -36,6 +46,9 @@ def main(path=None, step_n=None, loop_n=None, all_duration=None, checkout=True):
         dotenv run -- python rdagent/app/qlib_rd_loop/factor.py $LOG_PATH/__session__/1/0_propose  --step_n 1   # `step_n` is a optional paramter
 
     """
+    if not checkout_path is None:
+        checkout = Path(checkout_path)
+
     if path is None:
         model_loop = FactorRDLoop(FACTOR_PROP_SETTING)
     else:

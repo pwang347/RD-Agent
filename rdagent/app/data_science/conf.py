@@ -18,35 +18,48 @@ class DataScienceBasePropSetting(KaggleBasePropSetting):
     - For custom data science scenarios, use: "rdagent.scenarios.data_science.scen.DataScienceScen"
     """
 
-    hypothesis_gen: str = "rdagent.scenarios.data_science.proposal.exp_gen.proposal.DSProposalV2ExpGen"
+    planner: str = "rdagent.scenarios.data_science.proposal.exp_gen.planner.DSExpPlannerHandCraft"
+    hypothesis_gen: str = "rdagent.scenarios.data_science.proposal.exp_gen.router.ParallelMultiTraceExpGen"
+    trace_scheduler: str = "rdagent.scenarios.data_science.proposal.exp_gen.trace_scheduler.RoundRobinScheduler"
     """Hypothesis generation class"""
 
+    summarizer: str = "rdagent.scenarios.data_science.dev.feedback.DSExperiment2Feedback"
+    summarizer_init_kwargs: dict = {
+        "version": "exp_feedback",
+    }
     ## Workflow Related
     consecutive_errors: int = 5
 
     ## Coding Related
     coding_fail_reanalyze_threshold: int = 3
 
+    debug_recommend_timeout: int = 600
+    """The recommend time limit for running on debugging data"""
     debug_timeout: int = 600
     """The timeout limit for running on debugging data"""
+    full_recommend_timeout: int = 3600
+    """The recommend time limit for running on full data"""
     full_timeout: int = 3600
     """The timeout limit for running on full data"""
 
     ### specific feature
 
+    ### notebook integration
+    enable_notebook_conversion: bool = False
+
     #### enable specification
     spec_enabled: bool = True
 
     #### proposal related
-    proposal_version: str = "v1"
-    coder_on_whole_pipeline: bool = False
+    # proposal_version: str = "v2" deprecated
+
+    coder_on_whole_pipeline: bool = True
     max_trace_hist: int = 3
 
     coder_max_loop: int = 10
-    runner_max_loop: int = 1
+    runner_max_loop: int = 3
 
-    rule_base_eval: bool = False
-    sample_data: bool = True
+    sample_data_by_LLM: bool = True
     use_raw_description: bool = False
     show_nan_columns: bool = False
 
@@ -79,8 +92,11 @@ class DataScienceBasePropSetting(KaggleBasePropSetting):
     max_trace_num: int = 3
     """The maximum number of traces to grow before merging"""
 
+    scheduler_temperature: float = 1.0
+    """The temperature for the trace scheduler for softmax calculation, used in ProbabilisticScheduler"""
+
     #### multi-trace:checkpoint selector
-    selector_name: str = "rdagent.scenarios.data_science.proposal.exp_gen.ckp_select.LatestCKPSelector"
+    selector_name: str = "rdagent.scenarios.data_science.proposal.exp_gen.select.expand.LatestCKPSelector"
     """The name of the selector to use"""
     sota_count_window: int = 5
     """The number of trials to consider for SOTA count"""
@@ -88,28 +104,44 @@ class DataScienceBasePropSetting(KaggleBasePropSetting):
     """The threshold for SOTA count"""
 
     #### multi-trace: SOTA experiment selector
-    sota_exp_selector_name: str = "rdagent.scenarios.data_science.proposal.exp_gen.sota_exp_select.GlobalSOTASelector"
+    sota_exp_selector_name: str = "rdagent.scenarios.data_science.proposal.exp_gen.select.submit.GlobalSOTASelector"
     """The name of the SOTA experiment selector to use"""
 
     ### multi-trace:inject optimals for multi-trace
     # inject diverse when start a new sub-trace
     enable_inject_diverse: bool = False
 
-    # inject knowledge at the root of the trace
-    enable_inject_knowledge_at_root: bool = False
-
     # enable different version of DSExpGen for multi-trace
     enable_multi_version_exp_gen: bool = False
     exp_gen_version_list: str = "v3,v2"
 
     #### multi-trace: time for final multi-trace merge
-    merge_hours: int = 2
+    merge_hours: int = 0
     """The time for merge"""
 
     #### multi-trace: max SOTA-retrieved number, used in AutoSOTAexpSelector
     # constrains the number of SOTA experiments to retrieve, otherwise too many SOTA experiments to retrieve will cause the exceed of the context window of LLM
     max_sota_retrieved_num: int = 10
     """The maximum number of SOTA experiments to retrieve in a LLM call"""
+
+    #### enable draft before first sota experiment
+    enable_draft_before_first_sota: bool = False
+    enable_planner: bool = False
+
+    model_architecture_suggestion_time_percent: float = 0.75
+    allow_longer_timeout: bool = False
+    coder_longer_timeout_multiplier_upper: int = 3
+    runner_longer_timeout_multiplier_upper: int = 2
+    timeout_increase_stage: float = 0.3
+    show_hard_limit: bool = True
+
+    #### hypothesis critique and rewrite
+    enable_hypo_critique_rewrite: bool = True
+    """Enable hypothesis critique and rewrite stages for improving hypothesis quality"""
+    enable_scale_check: bool = False
+
+    #### enable runner code change summary
+    runner_enable_code_change_summary: bool = True
 
 
 DS_RD_SETTING = DataScienceBasePropSetting()

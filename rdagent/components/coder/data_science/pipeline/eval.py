@@ -16,6 +16,7 @@ from rdagent.components.coder.CoSTEER.knowledge_management import (
     CoSTEERQueriedKnowledgeV2,
 )
 from rdagent.components.coder.data_science.conf import get_clear_ws_cmd, get_ds_env
+from rdagent.components.coder.data_science.share.notebook import NotebookConverter
 from rdagent.components.coder.data_science.utils import remove_eda_part
 from rdagent.core.experiment import FBWorkspace, Task
 from rdagent.scenarios.data_science.test_eval import get_test_eval
@@ -53,13 +54,70 @@ class PipelineCoSTEEREvaluator(CoSTEEREvaluator):
                 final_decision=False,
             )
 
-        env = get_ds_env(extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()})
+        env = get_ds_env(
+            extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()},
+            running_timeout_period=self.scen.real_debug_timeout(),
+        )
 
-        # Clean the scores.csv & submission.csv.
+        stdout = ""
         implementation.execute(env=env, entry=get_clear_ws_cmd())
-        stdout, execute_ret_code = implementation.execute_ret_code(env=env, entry=f"python -m coverage run main.py")
-        stdout = remove_eda_part(stdout)
-        stdout += f"The code executed {'successfully' if execute_ret_code == 0 else 'failed'}."
+        if DS_RD_SETTING.sample_data_by_LLM:
+            # Because coder runs on full data, we need to run debug mode in advance to save time
+            result = implementation.run(
+                env=env, entry=f"strace -e trace=file -f -o trace.log python -m coverage run main.py --debug"
+            )
+        else:
+            result = implementation.run(
+                env=env, entry=f"strace -e trace=file -f -o trace.log python -m coverage run main.py"
+            )
+
+        nb_conversion_ret_code = 0
+        nb_conversion_check_text = ""
+        if DS_RD_SETTING.enable_notebook_conversion:
+            notebook_converter = NotebookConverter()
+            code = implementation.file_dict["main.py"]
+            error_msg = notebook_converter.validate_code_format(code)
+            if error_msg is not None:
+                nb_conversion_check_text = error_msg
+                nb_conversion_ret_code = 1
+            else:
+                notebook_converter.convert(
+                    task=target_task,
+                    code=code,
+                    stdout=result.stdout,
+                    outfile=implementation.workspace_path / "main.ipynb",
+                    use_debug_flag=DS_RD_SETTING.sample_data_by_LLM,
+                )
+
+        sample_submission_check = True
+        test_eval = get_test_eval()
+        if (sample_submission_file_name := test_eval.get_sample_submission_name(self.scen.competition)) is not None:
+            # check whether code ever opens the sample submission file
+            if (implementation.workspace_path / "trace.log").exists():
+                opened_trace_lines = [
+                    line
+                    for line in (implementation.workspace_path / "trace.log").read_text().splitlines()
+                    if "openat" in line and sample_submission_file_name in line
+                ]
+                if len(opened_trace_lines) > 0:
+                    stdout += f"Code opened the sample submission file '{sample_submission_file_name}' during execution.\n Reject the implementation!\n"
+                    sample_submission_check = False
+
+        result.stdout = remove_eda_part(result.stdout)
+        if result.exit_code != 0:
+            stdout += f"Code failed to run. Please check the stdout:\n Following the stdout of the debug mode run:\n{result.stdout.strip()}\n"
+        else:
+            stdout += f"Code ran successfully.\n Following the stdout of the debug mode run:\n{result.stdout.strip()}\n"
+        if DS_RD_SETTING.sample_data_by_LLM:
+            debug_time, full_estimated_time = None, None
+            if match := re.search(r"debug_time:\s*(\d+(?:.\d+)?)", result.stdout, re.DOTALL):
+                debug_time = float(match.group(1))
+            if match := re.search(r"estimated_time:\s*(\d+(?:.\d+)?)", result.stdout, re.DOTALL):
+                full_estimated_time = float(match.group(1))
+            if debug_time is not None and full_estimated_time is not None:
+                stdout += f"Debug mode ran in {debug_time:.2f} seconds, estimated full run time is {full_estimated_time:.2f} seconds. The estimated time is {full_estimated_time / env.conf.running_timeout_period * 100:.2f}% the debug time."
+            else:
+                stdout += "Debug mode did not provide debug_time or estimated_time, it's a buggy implementation.\n"
 
         score_fp = implementation.workspace_path / "scores.csv"
         score_ret_code = 0
@@ -82,8 +140,8 @@ class PipelineCoSTEEREvaluator(CoSTEEREvaluator):
                 if score_ret_code != 0:
                     score_check_text += f"The dataframe in file 'scores.csv' is:\n{score_df}"
 
-                # Check metric name (columns)
-                if score_df.columns.tolist() != [self.scen.metric_name]:
+                # Check metric name (columns) - case insensitive
+                if [col.lower() for col in score_df.columns.tolist()] != [self.scen.metric_name.lower()]:
                     score_check_text += f"\n[Error] The scores dataframe does not contain the correct column names.\nCorrect columns is: ['{self.scen.metric_name}']\nBut got: {score_df.columns.tolist()}"
                     score_ret_code = 1
 
@@ -98,31 +156,19 @@ class PipelineCoSTEEREvaluator(CoSTEEREvaluator):
                 score_ret_code = 1
 
         test_eval = get_test_eval()
-        if not test_eval.is_sub_enabled(self.scen.competition):
+        if DS_RD_SETTING.sample_data_by_LLM and test_eval.enabled(self.scen.competition):
+            submission_check_out, submission_ret_code = test_eval.valid(self.scen.competition, implementation)
+            stdout += f"\n### Submission check:\n{submission_check_out}\nIf Submission check returns a 'Submission is valid' or similar message, despite some warning messages, you should still consider the submission as valid and give a positive final decision. "
+        elif not test_eval.is_sub_enabled(self.scen.competition):
             submission_ret_code = 0
         else:
             # Check submission file
             base_check_code = T(".eval_tests.submission_format_test", ftype="txt").r()
             implementation.inject_files(**{"test/submission_format_test.py": base_check_code})
             # stdout += "----Submission Check 1-----\n"
-            submission_check_out, submission_ret_code = implementation.execute_ret_code(
-                env=env, entry="python test/submission_format_test.py"
-            )
-            if DS_RD_SETTING.rule_base_eval:
-                if execute_ret_code == 0 and score_ret_code == 0 and submission_ret_code == 0:
-                    return PipelineSingleFeedback(
-                        execution=stdout,
-                        return_checking=score_check_text + "\n" + submission_check_out,
-                        code="Code evaluation is not available.",
-                        final_decision=True,
-                    )
-                else:
-                    return PipelineSingleFeedback(
-                        execution=stdout,
-                        return_checking=score_check_text + "\n" + submission_check_out,
-                        code="Code evaluation is not available.",
-                        final_decision=False,
-                    )
+            submission_result = implementation.run(env=env, entry="python test/submission_format_test.py")
+            submission_check_out = submission_result.stdout
+            submission_ret_code = submission_result.exit_code
             stdout += "\n" + submission_check_out
 
         if not isinstance(implementation, FBWorkspace):
@@ -130,14 +176,26 @@ class PipelineCoSTEEREvaluator(CoSTEEREvaluator):
         else:
             eda_output = implementation.file_dict.get("EDA.md", None)
 
+        queried_similar_successful_knowledge = (
+            queried_knowledge.task_to_similar_task_successful_knowledge[target_task.get_task_information()]
+            if queried_knowledge is not None
+            else []
+        )
+
         system_prompt = T(".prompts:pipeline_eval.system").r(
-            scenario=self.scen.get_scenario_all_desc(eda_output=eda_output),
-            task_desc=target_task.get_task_information(),
             is_sub_enabled=test_eval.is_sub_enabled(self.scen.competition),
-            spec=T("scenarios.data_science.share:component_spec.Pipeline").r(),
+            debug_mode=DS_RD_SETTING.sample_data_by_LLM,
+            mle_check=DS_RD_SETTING.sample_data_by_LLM,
+            queried_similar_successful_knowledge=queried_similar_successful_knowledge,
         )
         user_prompt = T(".prompts:pipeline_eval.user").r(
+            scenario=self.scen.get_scenario_all_desc(eda_output=eda_output),
+            task_desc=target_task.get_task_information(),
             stdout=stdout.strip(),
+            spec=T("scenarios.data_science.share:component_spec.Pipeline").r(
+                metric_name=self.scen.metric_name,
+                enable_notebook_conversion=DS_RD_SETTING.enable_notebook_conversion,
+            ),
             code=implementation.file_dict["main.py"],
         )
         wfb = build_cls_from_json_with_retry(
@@ -146,10 +204,18 @@ class PipelineCoSTEEREvaluator(CoSTEEREvaluator):
             user_prompt=user_prompt,
             init_kwargs_update_func=PipelineSingleFeedback.val_and_update_init_dict,
         )
-        if score_ret_code != 0:
+        if score_ret_code != 0 and wfb.final_decision is True:
             wfb.final_decision = False
             wfb.return_checking += "\n" + score_check_text
-        if submission_ret_code != 0:
+        if submission_ret_code != 0 and wfb.final_decision is True:
             wfb.final_decision = False
             wfb.return_checking += "\nSubmission file check failed."
+        if sample_submission_check is False and wfb.final_decision is True:
+            wfb.final_decision = False
+            wfb.return_checking += (
+                "\nSample submission file check failed. Code should not open the sample submission file."
+            )
+        if nb_conversion_ret_code != 0 and wfb.final_decision is True:
+            wfb.final_decision = False
+            wfb.return_checking += "\n" + nb_conversion_check_text
         return wfb

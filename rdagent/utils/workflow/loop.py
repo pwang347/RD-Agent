@@ -10,13 +10,15 @@ Postscripts:
 
 import asyncio
 import concurrent.futures
-import datetime
+import os
 import pickle
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Union, cast
 
+import psutil
 from tqdm.auto import tqdm
 
 from rdagent.core.conf import RD_AGENT_SETTINGS
@@ -60,7 +62,8 @@ class LoopMeta(type):
         """
         steps = LoopMeta._get_steps(bases)  # all the base classes of parents
         for name, attr in attrs.items():
-            if not name.startswith("_") and callable(attr):
+            if not name.startswith("_") and callable(attr) and not isinstance(attr, type):
+                # NOTE: `not isinstance(attr, type)` is trying to exclude class type attribute
                 if name not in steps and name not in ["load", "dump"]:  # incase user override the load/dump method
                     # NOTE: if we override the step in the subclass
                     # Then it is not the new step. So we skip it.
@@ -71,8 +74,8 @@ class LoopMeta(type):
 
 @dataclass
 class LoopTrace:
-    start: datetime.datetime  # the start time of the trace
-    end: datetime.datetime  # the end time of the trace
+    start: datetime  # the start time of the trace
+    end: datetime  # the end time of the trace
     step_idx: int
     # TODO: more information about the trace
 
@@ -96,6 +99,7 @@ class LoopBase:
     ] = ()  # you can define a list of error that will withdraw current loop
 
     EXCEPTION_KEY = "_EXCEPTION"
+    LOOP_IDX_KEY = "_LOOP_IDX"
     SENTINEL = -1
 
     _pbar: tqdm  # progress bar instance
@@ -112,7 +116,9 @@ class LoopBase:
         self.step_idx: defaultdict[int, int] = defaultdict(int)  # dict from loop index to next step index
         self.queue: asyncio.Queue[Any] = asyncio.Queue()
 
-        # Store step results for all loops in a nested dictionary: loop_prev_out[loop_index][step_name]
+        # Store step results for all loops in a nested dictionary, following information will be stored:
+        # - loop_prev_out[loop_index][step_name]: the output of the step function
+        # - loop_prev_out[loop_index][<special keys like LOOP_IDX_KEY or EXCEPTION_KEY>]: the special keys
         self.loop_prev_out: dict[int, dict[str, Any]] = defaultdict(dict)
         self.loop_trace = defaultdict(list[LoopTrace])  # the key is the number of loop
         self.session_folder = Path(LOG_SETTINGS.trace_path) / "__session__"
@@ -136,9 +142,12 @@ class LoopBase:
         if isinstance(limit := RD_AGENT_SETTINGS.step_semaphore, dict):
             limit = limit.get(step_name, 1)  # default to 1 if not specified
 
-        # NOTE: we assume the record step is always the last step to modify the global environment,
-        # so we set the limit to 1 to avoid race condition
-        if step_name == "record":
+        # NOTE:
+        # (1) we assume the record step is always the last step to modify the global environment,
+        #     so we set the limit to 1 to avoid race condition
+        # (2) Because we support (-1,) as local selection; So it is hard to align a) the comparision target in `feedbck`
+        #     and b) parent node in `record`; So we prevent parallelism in `feedback` and `record` to avoid inconsistency
+        if step_name in ("record", "feedback"):
             limit = 1
 
         if step_name not in self.semaphores:
@@ -157,7 +166,7 @@ class LoopBase:
             self._pbar.close()
             del self._pbar
 
-    def _check_exit_conditions_on_step(self) -> None:
+    def _check_exit_conditions_on_step(self, loop_id: Optional[int] = None, step_id: Optional[int] = None) -> None:
         """Check if the loop should continue or terminate.
 
         Raises
@@ -204,11 +213,14 @@ class LoopBase:
             self.tracker.log_workflow_state()
 
             with logger.tag(f"Loop_{li}.{name}"):
-                start = datetime.datetime.now(datetime.timezone.utc)
+                start = datetime.now(timezone.utc)
                 func: Callable[..., Any] = cast(Callable[..., Any], getattr(self, name))
 
                 next_step_idx = si + 1
                 step_forward = True
+                # NOTE: each step are aware are of current loop index
+                # It is very important to set it before calling the step function!
+                self.loop_prev_out[li][self.LOOP_IDX_KEY] = li
                 try:
                     # Call function with current loop's output, await if coroutine or use ProcessPoolExecutor for sync if required
                     if force_subproc:
@@ -225,9 +237,6 @@ class LoopBase:
                     # Store result in the nested dictionary
                     self.loop_prev_out[li][name] = result
 
-                    # Record the trace
-                    end = datetime.datetime.now(datetime.timezone.utc)
-                    self.loop_trace[li].append(LoopTrace(start, end, step_idx=si))
                     # Save snapshot after completing the step
                     self.dump(self.session_folder / f"{li}" / f"{si}_{name}")
                 except Exception as e:
@@ -247,6 +256,16 @@ class LoopBase:
                     else:
                         raise  # re-raise unhandled exceptions
                 finally:
+                    # Record the trace
+                    end = datetime.now(timezone.utc)
+                    self.loop_trace[li].append(LoopTrace(start, end, step_idx=si))
+                    logger.log_object(
+                        {
+                            "start_time": start,
+                            "end_time": end,
+                        },
+                        tag="time_info",
+                    )
                     if step_forward:
                         # Increment step index
                         self.step_idx[li] = next_step_idx
@@ -260,7 +279,7 @@ class LoopBase:
                             step_index=next_step,
                             step_name=self.steps[next_step],
                         )
-                        self._check_exit_conditions_on_step()
+                        self._check_exit_conditions_on_step(loop_id=li, step_id=si)
                     else:
                         logger.warning(f"Step forward {si} of loop {li} is skipped.")
 
@@ -330,18 +349,28 @@ class LoopBase:
             0  # if we rerun the loop, we should revert the loop index to 0 to make sure every loop is correctly kicked
         )
 
+        tasks: list[asyncio.Task] = []
         while True:
             try:
                 # run one kickoff_loop and execute_loop
-                await asyncio.gather(
-                    self.kickoff_loop(), *[self.execute_loop() for _ in range(RD_AGENT_SETTINGS.get_max_parallel())]
-                )
+                tasks = [
+                    asyncio.create_task(t)
+                    for t in [
+                        self.kickoff_loop(),
+                        *[self.execute_loop() for _ in range(RD_AGENT_SETTINGS.get_max_parallel())],
+                    ]
+                ]
+                await asyncio.gather(*tasks)
                 break
             except self.LoopResumeError as e:
                 logger.warning(f"Stop all the routines and resume loop: {e}")
                 self.loop_idx = 0
+                # cancel all previous tasks before resuming all loops.
+                for t in tasks:
+                    t.cancel()
             except self.LoopTerminationError as e:
                 logger.warning(f"Reach stop criterion and stop loop: {e}")
+                kill_subprocesses()  # NOTE: coroutine-based workflow can't automatically stop subprocesses.
                 break
             finally:
                 self.close_pbar()
@@ -471,3 +500,25 @@ class LoopBase:
         self.__dict__.update(state)
         self.queue = asyncio.Queue()
         self.semaphores = {}
+
+
+def kill_subprocesses() -> None:
+    """
+    Due to the coroutine-based nature of the workflow, the event loop of the main process can't
+    stop all the subprocesses start by `curr_loop.run_in_executor`. So we need to kill them manually.
+    Otherwise, the subprocesses will keep running in the background and the the main process keeps waiting.
+    """
+    current_proc = psutil.Process(os.getpid())
+    for child in current_proc.children(recursive=True):
+        try:
+            print(f"Terminating subprocess PID {child.pid} ({child.name()})")
+            child.terminate()
+        except Exception as ex:
+            print(f"Could not terminate subprocess {child.pid}: {ex}")
+    _, alive = psutil.wait_procs(current_proc.children(recursive=True), timeout=3)
+    for p in alive:
+        try:
+            print(f"Killing still alive subprocess PID {p.pid} ({p.name()})")
+            p.kill()
+        except Exception as ex:
+            print(f"Could not kill subprocess {p.pid}: {ex}")
