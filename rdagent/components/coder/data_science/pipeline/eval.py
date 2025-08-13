@@ -63,13 +63,9 @@ class PipelineCoSTEEREvaluator(CoSTEEREvaluator):
         implementation.execute(env=env, entry=get_clear_ws_cmd())
         if DS_RD_SETTING.sample_data_by_LLM:
             # Because coder runs on full data, we need to run debug mode in advance to save time
-            result = implementation.run(
-                env=env, entry=f"strace -e trace=file -f -o trace.log python -m coverage run main.py --debug"
-            )
+            result = implementation.run(env=env, entry=f"python -m coverage run main.py --debug")
         else:
-            result = implementation.run(
-                env=env, entry=f"strace -e trace=file -f -o trace.log python -m coverage run main.py"
-            )
+            result = implementation.run(env=env, entry=f"python -m coverage run main.py")
 
         nb_conversion_ret_code = 0
         nb_conversion_check_text = ""

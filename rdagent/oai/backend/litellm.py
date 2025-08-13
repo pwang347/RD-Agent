@@ -78,9 +78,22 @@ class LiteLLMAPIBackend(APIBackend):
                 f"{LogColors.MAGENTA}Creating embedding{LogColors.END} for: {input_content_list}",
                 tag="debug_litellm_emb",
             )
+
+        token_provider = None
+        if LITELLM_SETTINGS.embedding_use_azure_token_provider:
+            from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(exclude_interactive_browser_credential=False),
+                "https://cognitiveservices.azure.com/.default",
+            )
+
         response = embedding(
             model=model_name,
             input=input_content_list,
+            api_version=LITELLM_SETTINGS.embedding_azure_api_version,
+            api_base=LITELLM_SETTINGS.embedding_azure_api_base,
+            azure_ad_token_provider=token_provider,
         )
         response_list = [data["embedding"] for data in response.data]
         return response_list
@@ -129,6 +142,15 @@ class LiteLLMAPIBackend(APIBackend):
                         else:
                             reasoning_effort = None
                     break
+        token_provider = None
+        if LITELLM_SETTINGS.chat_use_azure_token_provider:
+            from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(exclude_interactive_browser_credential=False),
+                "https://cognitiveservices.azure.com/.default",
+            )
+
         response = completion(
             model=model,
             messages=messages,
@@ -137,6 +159,9 @@ class LiteLLMAPIBackend(APIBackend):
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             max_retries=0,
+            api_version=LITELLM_SETTINGS.chat_azure_api_version,
+            api_base=LITELLM_SETTINGS.chat_azure_api_base,
+            azure_ad_token_provider=token_provider,
             **kwargs,
         )
         logger.info(f"{LogColors.GREEN}Using chat model{LogColors.END} {model}", tag="llm_messages")
